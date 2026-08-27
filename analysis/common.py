@@ -180,10 +180,76 @@ def load_tables(data_dir: str = None, deduplicate: bool = True) -> AnalysisTable
 
     return tables
 
+# IC
+def build_merge_artifact_frame(tables: AnalysisTables) -> pd.DataFrame:
+    """Merge-level analysis frame with artifact-type composition (Q1).
+
+    Unlike build_merge_frame (which counts conflicting chunks — a Q2
+    structural measure), this frame aggregates over *distinct conflicting
+    files* per merge, categorized by artifact type, to avoid conflating
+    artifact type (Q1) with conflict volume (Q2).
+    """
+    from file_category import categorize_filepath
+
+    merges = tables.internal_merges
+    if merges.empty:
+        return merges
+
+    merges = _dedup_on(merges, _MERGE_KEY).copy()
+
+    if tables.classified_chunks.empty:
+        merges["n_files_conflicting"] = 0
+        return merges
+
+    # Collapse to one row per distinct conflicting FILE per merge (not per
+    # chunk): a file with 10 chunks and a file with 1 chunk must each count
+    # once here, or M1's composition would silently encode chunk volume.
+    files = tables.classified_chunks[
+        ["repo_full_name", "merge_sha", "file_path"]
+    ].drop_duplicates()
+
+    files = files.copy()
+    files["file_category"] = files["file_path"].apply(categorize_filepath)
+
+    # n_files_conflicting: total distinct conflicting files per merge (used
+    # as the denominator for M1 proportions and to detect n=1 edge cases,
+    # e.g. for M2's "misto" threshold rule).
+    n_files = (
+        files.groupby(["repo_full_name", "merge_sha"])
+        .size()
+        .rename("n_files_conflicting")
+        .reset_index()
+    )
+
+    # Wide composition table: one column per artifact type, values = count
+    # of distinct files of that type in the merge. This is the raw input
+    composition = (
+        files.groupby(["repo_full_name", "merge_sha", "file_category"])
+        .size()
+        .unstack(fill_value=0)
+        .add_prefix("n_files_")
+        .reset_index()
+    )
+
+    merges = merges.merge(n_files, on=["repo_full_name", "merge_sha"], how="left")
+    merges = merges.merge(composition, on=["repo_full_name", "merge_sha"], how="left")
+
+    merges["n_files_conflicting"] = merges["n_files_conflicting"].fillna(0).astype(int)
+    category_cols = [c for c in merges.columns if c.startswith("n_files_") and c != "n_files_conflicting"]
+    merges[category_cols] = merges[category_cols].fillna(0).astype(int)
+
+    # Join with PR context
+    pctx = _pr_context(tables.universe)
+    if not pctx.empty:
+        merges = merges.merge(pctx, on="pr_id", how="left")
+        merges = _apply_language_topn(merges)
+
+    return merges
+
 
 def build_chunk_frame(tables: AnalysisTables) -> pd.DataFrame:
     """Chunk-level analysis frame with strategy and context."""
-    from file_category import categorize_filepath
+    from .file_category import categorize_filepath
 
     chunks = tables.classified_chunks
     if chunks.empty:
@@ -319,6 +385,7 @@ __all__ = [
     'load_tables',
     'build_chunk_frame',
     'build_merge_frame',
+    'build_merge_artifact_frame',
     'stratum_order',
     'stratify',
     'setup_style',
