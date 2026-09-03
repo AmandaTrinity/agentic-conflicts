@@ -189,7 +189,7 @@ def build_merge_artifact_frame(tables: AnalysisTables) -> pd.DataFrame:
     files* per merge, categorized by artifact type, to avoid conflating
     artifact type (Q1) with conflict volume (Q2).
     """
-    from file_category import categorize_filepath
+    from .file_category import categorize_filepath
 
     merges = tables.internal_merges
     if merges.empty:

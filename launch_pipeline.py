@@ -33,17 +33,15 @@ from analysis.rq2_detailed import analyze_rq2_detailed
 from analysis.plotting import generate_all_figures
 from analysis import reproduce_paper_statistics
 from src.analysis_utils import (
-    process_single_repository,
     aggregate_jsonl_to_parquet,
     append_jsonl,
-    cleanup_repo_scratch,
     create_final_merge_audit,
 )
 from src.pr_chronology import (
-    extract_pr_commits,
     append_jsonl as append_jsonl_pr,
     aggregate_pr_commits_to_parquet,
 )
+from src.fused_mining import process_repository_fused
 
 
 def setup_logging(log_file: Path):
@@ -87,8 +85,27 @@ def build_universe(
     logging.info("Stage 0: Building universe DataFrame from AIDev...")
 
     try:
-        pr_df = pd.read_parquet(aidev_dir / "all_pull_request.parquet")
-        repo_df = pd.read_parquet(aidev_dir / "all_repository.parquet")
+        pr_df = pd.read_parquet(
+            aidev_dir / "all_pull_request.parquet",
+            columns=[
+                "id",
+                "number",
+                "repo_url",
+                "repo_id",
+                "agent",
+                "state",
+                "merged_at",
+            ],
+        )
+
+        repo_df = pd.read_parquet(
+            aidev_dir / "all_repository.parquet",
+            columns=[
+                "id",
+                "full_name",
+                "language",
+            ],
+        )
     except FileNotFoundError as e:
         logging.error(f"Required AIDev file not found: {e}")
         raise
@@ -163,66 +180,6 @@ def mark_repo_processed(data_dir: Path, repo_name: str):
         f.write(f"{repo_name}\n")
 
 
-def extract_pr_chronology(
-    universe_df: pd.DataFrame,
-    scratch_dir: Path,
-    data_dir: Path,
-    workers: int = 1,
-):
-    """Extract PR commit chronology using Git refs (Stage 0.5).
-
-    For each PR, extract all commits between fork point and PR tip.
-    Generates pr_commits.parquet used by subsequent analysis stages.
-    """
-    logging.info(f"Stage 0.5: Extracting PR chronology (workers={workers})...")
-
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    # Build list of repositories to process
-    repo_groups = []
-    for repo_name, repo_data in universe_df.groupby('full_name'):
-        if not repo_data.empty:
-            repo_groups.append((repo_name, repo_data))
-
-    total_repos = len(repo_groups)
-    logging.info(f"Extracting chronology for {total_repos} repositories...")
-
-    # Bind scratch_dir to the function
-    extract_func = functools.partial(extract_pr_commits, scratch_dir=scratch_dir)
-
-    processed = 0
-    if workers == 1:
-        for i, repo_info in enumerate(repo_groups):
-            repo_name, chronology, errs = extract_func(repo_info)
-            logging.info(f"[{i+1}/{total_repos}] {repo_name}")
-
-            if chronology:
-                append_jsonl_pr("pr_commits.jsonl", chronology, data_dir)
-                processed += 1
-            if errs:
-                append_jsonl_pr("pr_chronology_errors.jsonl", errs, data_dir)
-    else:
-        with multiprocessing.Pool(workers) as pool:
-            for i, (repo_name, chronology, errs) in enumerate(
-                pool.imap_unordered(extract_func, repo_groups)
-            ):
-                logging.info(f"[{i+1}/{total_repos}] {repo_name}")
-
-                if chronology:
-                    append_jsonl_pr("pr_commits.jsonl", chronology, data_dir)
-                    processed += 1
-                if errs:
-                    append_jsonl_pr("pr_chronology_errors.jsonl", errs, data_dir)
-
-    # Aggregate to parquet
-    logging.info("Aggregating PR chronology to parquet...")
-    commits_df = aggregate_pr_commits_to_parquet(data_dir)
-
-    logging.info(f"Stage 0.5 complete ({processed} repositories with PR commits)")
-    return commits_df
-
-
 def attach_pr_chronology(universe_df: pd.DataFrame, commits_df: pd.DataFrame, data_dir: Path) -> pd.DataFrame:
     """Replace placeholder SHA rows with extracted PR chronology."""
     if commits_df is None or commits_df.empty:
@@ -247,14 +204,26 @@ def attach_pr_chronology(universe_df: pd.DataFrame, commits_df: pd.DataFrame, da
     return updated
 
 
-def process_repositories(
+def process_repositories_fused(
     universe_df: pd.DataFrame,
     scratch_dir: Path,
     data_dir: Path,
     workers: int = 1,
-):
-    """Mine internal merge commits in parallel."""
-    logging.info(f"Stage 1: Mining merge commits (workers={workers})...")
+) -> pd.DataFrame:
+    """Extract PR chronology and mine internal merge commits in one pass per repo.
+
+    Fuses the former Stage 0.5 (PR chronology) and Stage 1 (merge mining)
+    into a single clone/fetch/cleanup cycle per repository -- see
+    src/fused_mining.py. Output files are identical to the two-stage
+    pipeline (pr_commits.*, internal_merges.*, conflict_chunks.*,
+    resolved_chunks.*, classified_chunks.*, extraction_errors.*,
+    pr_chronology_errors.jsonl), and the run remains resumable via
+    processed_repos.txt.
+
+    Returns the universe DataFrame updated with the extracted chronology
+    (same as the old attach_pr_chronology step).
+    """
+    logging.info(f"Stage 1 (fused chronology + mining, workers={workers})...")
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -271,43 +240,37 @@ def process_repositories(
     total_repos = len(repo_groups)
     logging.info(f"Processing {total_repos} repositories...")
 
-    # Bind scratch_dir to the function using functools.partial
-    process_func = functools.partial(process_single_repository, scratch_dir=scratch_dir)
+    process_func = functools.partial(process_repository_fused, scratch_dir=scratch_dir)
+
+    def _handle_result(i, result):
+        repo_name, chronology, chron_errs, im, cc, rc, ca, errs = result
+        logging.info(f"[{i+1}/{total_repos}] {repo_name}")
+
+        append_jsonl_pr("pr_commits.jsonl", chronology, data_dir)
+        append_jsonl_pr("pr_chronology_errors.jsonl", chron_errs, data_dir)
+        append_jsonl("internal_merges.jsonl", im, data_dir)
+        append_jsonl("conflict_chunks.jsonl", cc, data_dir)
+        append_jsonl("resolved_chunks.jsonl", rc, data_dir)
+        append_jsonl("classified_chunks.jsonl", ca, data_dir)
+        append_jsonl("extraction_errors.jsonl", errs, data_dir)
+        mark_repo_processed(data_dir, repo_name)
+
+        if (i + 1) % max(1, total_repos // 10) == 0:
+            log_disk_usage(data_dir)
 
     if workers == 1:
         for i, repo_info in enumerate(repo_groups):
-            repo_name, im, cc, rc, ca, errs = process_func(repo_info)
-            logging.info(f"[{i+1}/{total_repos}] {repo_name}")
-
-            append_jsonl("internal_merges.jsonl", im, data_dir)
-            append_jsonl("conflict_chunks.jsonl", cc, data_dir)
-            append_jsonl("resolved_chunks.jsonl", rc, data_dir)
-            append_jsonl("classified_chunks.jsonl", ca, data_dir)
-            append_jsonl("extraction_errors.jsonl", errs, data_dir)
-            mark_repo_processed(data_dir, repo_name)
-
-            # Log disk usage periodically
-            if (i + 1) % max(1, total_repos // 10) == 0:
-                log_disk_usage(data_dir)
+            _handle_result(i, process_func(repo_info))
     else:
         with multiprocessing.Pool(workers) as pool:
-            for i, (repo_name, im, cc, rc, ca, errs) in enumerate(
-                pool.imap_unordered(process_func, repo_groups)
-            ):
-                logging.info(f"[{i+1}/{total_repos}] {repo_name}")
-
-                append_jsonl("internal_merges.jsonl", im, data_dir)
-                append_jsonl("conflict_chunks.jsonl", cc, data_dir)
-                append_jsonl("resolved_chunks.jsonl", rc, data_dir)
-                append_jsonl("classified_chunks.jsonl", ca, data_dir)
-                append_jsonl("extraction_errors.jsonl", errs, data_dir)
-                mark_repo_processed(data_dir, repo_name)
-
-                # Log disk usage periodically
-                if (i + 1) % max(1, total_repos // 10) == 0:
-                    log_disk_usage(data_dir)
+            for i, result in enumerate(pool.imap_unordered(process_func, repo_groups)):
+                _handle_result(i, result)
 
     logging.info("Stage 1 complete")
+
+    logging.info("Aggregating PR chronology to parquet...")
+    commits_df = aggregate_pr_commits_to_parquet(data_dir)
+    return attach_pr_chronology(universe_df, commits_df, data_dir)
 
 
 def create_resolver_labels(data_dir: Path):
@@ -424,11 +387,8 @@ def main():
 
             scratch_dir = data_dir / 'scratch'
 
-            logging.info("\nStage 0.5: Extracting PR Chronology...")
-            commits_df = extract_pr_chronology(universe_df, scratch_dir, data_dir, workers=args.workers)
-            universe_df = attach_pr_chronology(universe_df, commits_df, data_dir)
-
-            process_repositories(universe_df, scratch_dir, data_dir, workers=args.workers)
+            logging.info("\nStage 1: Extracting PR Chronology + Mining Merge Commits (fused)...")
+            universe_df = process_repositories_fused(universe_df, scratch_dir, data_dir, workers=args.workers)
 
             logging.info("\nStage 2: Aggregating JSONL to Parquet...")
             aggregate_jsonl_to_parquet(data_dir)

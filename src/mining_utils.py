@@ -136,7 +136,7 @@ def clone_repo_bare(repo_url: str, repos_dir: Path) -> Optional[Path]:
             logging.info(f"Fetching updates for {repo_url}...")
             run_git_command(
                 repo_path, "fetch", "origin", "+refs/heads/*:refs/heads/*", "--prune",
-                timeout=1800
+                timeout=300
             )
         else:
             logging.info(f"Cloning {repo_url} into {repo_path}...")
@@ -145,7 +145,7 @@ def clone_repo_bare(repo_url: str, repos_dir: Path) -> Optional[Path]:
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=1800,
+                timeout=300,
                 env=my_env
             )
         return repo_path
