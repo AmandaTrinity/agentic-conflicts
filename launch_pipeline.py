@@ -33,15 +33,12 @@ from analysis.rq2_detailed import analyze_rq2_detailed
 from analysis.plotting import generate_all_figures
 from analysis import reproduce_paper_statistics
 from src.analysis_utils import (
-    aggregate_jsonl_to_parquet,
     append_jsonl,
     create_final_merge_audit,
 )
-from src.pr_chronology import (
-    append_jsonl as append_jsonl_pr,
-    aggregate_pr_commits_to_parquet,
-)
+from src.pr_chronology import append_jsonl as append_jsonl_pr
 from src.fused_mining import process_repository_fused
+from src.compaction import flush_batch, merge_batches
 
 
 def setup_logging(log_file: Path):
@@ -209,6 +206,7 @@ def process_repositories_fused(
     scratch_dir: Path,
     data_dir: Path,
     workers: int = 1,
+    compact_every: int = 1000,
 ) -> pd.DataFrame:
     """Extract PR chronology and mine internal merge commits in one pass per repo.
 
@@ -217,13 +215,20 @@ def process_repositories_fused(
     src/fused_mining.py. Output files are identical to the two-stage
     pipeline (pr_commits.*, internal_merges.*, conflict_chunks.*,
     resolved_chunks.*, classified_chunks.*, extraction_errors.*,
-    pr_chronology_errors.jsonl), and the run remains resumable via
+    pr_chronology_errors.*), and the run remains resumable via
     processed_repos.txt.
+
+    Every `compact_every` repositories, the JSONL intermediates accumulated
+    so far are flushed into a small Parquet batch and cleared (see
+    src/compaction.py), so JSONL disk usage stays bounded instead of
+    growing for the entire run -- at AIDev v5's scale this was measured to
+    otherwise reach ~1.2TB before ever being converted. Set to 0 to disable
+    periodic flushing (matches the old one-shot-at-the-end behaviour).
 
     Returns the universe DataFrame updated with the extracted chronology
     (same as the old attach_pr_chronology step).
     """
-    logging.info(f"Stage 1 (fused chronology + mining, workers={workers})...")
+    logging.info(f"Stage 1 (fused chronology + mining, workers={workers}, compact_every={compact_every})...")
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +263,10 @@ def process_repositories_fused(
         if (i + 1) % max(1, total_repos // 10) == 0:
             log_disk_usage(data_dir)
 
+        if compact_every and (i + 1) % compact_every == 0:
+            flush_batch(data_dir)
+            log_disk_usage(data_dir)
+
     if workers == 1:
         for i, repo_info in enumerate(repo_groups):
             _handle_result(i, process_func(repo_info))
@@ -268,8 +277,12 @@ def process_repositories_fused(
 
     logging.info("Stage 1 complete")
 
-    logging.info("Aggregating PR chronology to parquet...")
-    commits_df = aggregate_pr_commits_to_parquet(data_dir)
+    logging.info("Compacting remaining JSONL and merging all batches to Parquet...")
+    flush_batch(data_dir)  # flush whatever accumulated since the last periodic flush
+    merge_batches(data_dir)  # merge every batch (+ any existing canonical parquet)
+
+    commits_path = data_dir / "pr_commits.parquet"
+    commits_df = pd.read_parquet(commits_path) if commits_path.exists() else pd.DataFrame()
     return attach_pr_chronology(universe_df, commits_df, data_dir)
 
 
@@ -300,6 +313,10 @@ def main():
                         help='Run pilot mode on N repositories')
     parser.add_argument('--workers', type=int, default=1,
                         help='Number of parallel workers (default: 1)')
+    parser.add_argument('--compact-every', type=int, default=1000,
+                        help='Flush JSONL intermediates to batched Parquet every N '
+                             'repositories, to keep disk usage bounded (default: 1000; '
+                             'use 0 to disable and only convert once at the end)')
     parser.add_argument('--cleanup-scratch', action='store_true',
                         help='Aggressively clean scratch after each repo (already done in finally, this is extra)')
 
@@ -388,10 +405,13 @@ def main():
             scratch_dir = data_dir / 'scratch'
 
             logging.info("\nStage 1: Extracting PR Chronology + Mining Merge Commits (fused)...")
-            universe_df = process_repositories_fused(universe_df, scratch_dir, data_dir, workers=args.workers)
+            universe_df = process_repositories_fused(
+                universe_df, scratch_dir, data_dir,
+                workers=args.workers, compact_every=args.compact_every,
+            )
 
             logging.info("\nStage 2: Aggregating JSONL to Parquet...")
-            aggregate_jsonl_to_parquet(data_dir)
+            merge_batches(data_dir)  # safety net; process_repositories_fused already compacted everything
 
             logging.info("\nStage 2b: Creating final merge audit...")
             create_final_merge_audit(data_dir)
