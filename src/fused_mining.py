@@ -15,6 +15,7 @@ output records and schemas are identical to the two-stage pipeline.
 """
 
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -47,6 +48,7 @@ def process_repository_fused(repo_info: Tuple[str, pd.DataFrame], scratch_dir: P
     """
     repo_full_name, repo_df = repo_info
     repo_url = _normalize_repo_url(repo_df.iloc[0]['repo_url'])
+    t0 = time.time()
 
     if scratch_dir is None:
         raise ValueError("scratch_dir must be provided")
@@ -70,6 +72,7 @@ def process_repository_fused(repo_info: Tuple[str, pd.DataFrame], scratch_dir: P
             "error_type": "clone_failed",
             "error_message": "Failed to clone or update repository",
         })
+        logging.info(f"[TIMING] {repo_full_name}: {time.time() - t0:.1f}s (clone_failed)")
         return (repo_full_name, chronology_records, chronology_errors,
                 internal_merges, conflict_chunks, resolved_chunks, classified_chunks, extraction_errors)
 
@@ -230,6 +233,7 @@ def process_repository_fused(repo_info: Tuple[str, pd.DataFrame], scratch_dir: P
         chronology_errors.append({"repo_full_name": repo_full_name, "error": str(e)})
     finally:
         cleanup_repo_scratch(repo_path)
+        logging.info(f"[TIMING] {repo_full_name}: {time.time() - t0:.1f}s (prs={len(repo_df)})")
 
     return (repo_full_name, chronology_records, chronology_errors,
             internal_merges, conflict_chunks, resolved_chunks, classified_chunks, extraction_errors)
