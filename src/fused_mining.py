@@ -76,15 +76,27 @@ def process_repository_fused(repo_info: Tuple[str, pd.DataFrame], scratch_dir: P
     sha_cache: Dict[str, Tuple[str, Dict]] = {}
 
     try:
+        pr_rows = repo_df.drop_duplicates(subset=["pr_id"])
+        pr_numbers = sorted({int(n) for n in pr_rows["number"].dropna().unique()})
+
+        # Fetch only the PR head refs this repo's AIDev rows actually reference,
+        # instead of every PR ref the repository has ever had (refs/pull/*/head) --
+        # for popular repos with thousands of unrelated historical PRs, the
+        # wildcard fetch pulls in commit objects for PRs we never look at.
+        if not pr_numbers:
+            chronology_errors.append({"repo_full_name": repo_full_name, "error": "no_pr_numbers"})
+            return (repo_full_name, chronology_records, chronology_errors,
+                    internal_merges, conflict_chunks, resolved_chunks, classified_chunks, extraction_errors)
+
+        refspecs = [f"+refs/pull/{n}/head:refs/pull/{n}/head" for n in pr_numbers]
         fetch_bytes = run_git_command(
-            repo_path, "fetch", "origin", "+refs/pull/*/head:refs/pull/*/head", check=False
+            repo_path, "fetch", "origin", *refspecs, check=False
         )
         if fetch_bytes is None:
             chronology_errors.append({"repo_full_name": repo_full_name, "error": "fetch_failed"})
             return (repo_full_name, chronology_records, chronology_errors,
                     internal_merges, conflict_chunks, resolved_chunks, classified_chunks, extraction_errors)
 
-        pr_rows = repo_df.drop_duplicates(subset=["pr_id"])
         for _, row in pr_rows.iterrows():
             pr_id = row['pr_id']
             pr_number = row['number']
