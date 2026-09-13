@@ -63,7 +63,26 @@ def cleanup_repo_scratch(repo_path: Path) -> bool:
 def is_bot_signature(text: str) -> bool:
     """Classify if a string matches typical agent/bot signatures."""
     t = text.lower()
-    bot_markers = ["[bot]", "-bot", "copilot", "devin", "claude", "cursor", "openai"]
+    # Markers must cover every agent AIDev v5 actually labels PRs with
+    # (all_pull_request.parquet['agent']: OpenAI_Codex, Copilot, Claude_Code,
+    # Cursor, Google_Jules, Devin). "codex" and "jules" were missing here even
+    # though OpenAI_Codex alone is ~50% of the dataset's PRs -- its GitHub App
+    # bot account is "chatgpt-codex-connector[bot]" (matches "codex", not
+    # "openai"), and Google Jules's is "google-labs-jules[bot]".
+    #
+    # Bare "jules" was avoided (collides with humans named Jules) in favor of
+    # two markers confirmed against real commits: "google-labs-jules" catches
+    # commits/co-authored-by lines naming the bot account directly (e.g.
+    # "Co-authored-by: google-labs-jules[bot] <...@users.noreply.github.com>",
+    # github.com/Maatify/event-logging@4070718), and "devbox.com"/"devbox.local"
+    # catches Jules's other observed co-authored-by format, which drops the
+    # bot slug entirely (e.g. "Co-authored-by: Jules <jules@devbox.com>",
+    # github.com/fderuiter/sortify@7f6b86e) -- no human legitimately has a
+    # devbox.com/.local email, so this is a safe, specific signal.
+    bot_markers = [
+        "[bot]", "-bot", "copilot", "devin", "claude", "cursor", "openai",
+        "codex", "google-labs-jules", "devbox.com", "devbox.local",
+    ]
     if t.endswith("bot"):
         return True
     return any(marker in t for marker in bot_markers)
