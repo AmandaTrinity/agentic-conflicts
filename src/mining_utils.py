@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import signal
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Generator, Any
@@ -113,6 +114,39 @@ def _is_valid_bare_repo(repo_path: Path, env: dict) -> bool:
     return result.stdout.strip() == b"true"
 
 
+def _wait_for_disk_space(
+    path: Path, min_free_gb: float = 20.0, max_wait_s: int = 600, poll_s: int = 10
+) -> bool:
+    """Block until `path`'s filesystem has at least `min_free_gb` free.
+
+    LPT scheduling processes the highest-PR-count repos first, so at the
+    start of a full run every worker is simultaneously cloning one of the
+    largest repos in the whole dataset -- the worst possible case for peak
+    disk usage. This is what actually happened on the v5 full run: /home hit
+    98% full (6GB free of 248GB) within the first hour, and git write
+    failures cascaded across every worker at once, killing the run. Waiting
+    here (instead of racing every worker to write a fresh multi-GB clone
+    into an already-tight disk) lets other workers' post-repo cleanup
+    (cleanup_repo_scratch) free space first.
+
+    Returns False (caller should treat as clone failure) if still below
+    min_free_gb after max_wait_s -- this is a real, not-transient shortage.
+    """
+    waited = 0
+    while waited < max_wait_s:
+        free_gb = shutil.disk_usage(path).free / (1024 ** 3)
+        if free_gb >= min_free_gb:
+            return True
+        logging.warning(
+            f"Low disk space ({free_gb:.1f} GB free on {path}) -- pausing "
+            f"before starting a new clone ({waited}s waited so far, "
+            f"giving up at {max_wait_s}s)."
+        )
+        time.sleep(poll_s)
+        waited += poll_s
+    return False
+
+
 def clone_repo_bare(repo_url: str, repos_dir: Path) -> Optional[Path]:
     """Clone or update a bare repository."""
     repo_name = (
@@ -123,6 +157,13 @@ def clone_repo_bare(repo_url: str, repos_dir: Path) -> Optional[Path]:
     my_env = os.environ.copy()
     my_env["GIT_TERMINAL_PROMPT"] = "0"
     my_env["GIT_CEILING_DIRECTORIES"] = str(repos_dir.resolve())
+
+    if not repo_path.exists() and not _wait_for_disk_space(repos_dir):
+        logging.error(
+            f"Giving up on {repo_url}: insufficient disk space on {repos_dir} "
+            f"after waiting"
+        )
+        return None
 
     try:
         if repo_path.exists() and not _is_valid_bare_repo(repo_path, my_env):
@@ -151,9 +192,14 @@ def clone_repo_bare(repo_url: str, repos_dir: Path) -> Optional[Path]:
         return repo_path
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to clone/fetch {repo_url}: {e.stderr.decode('utf-8', 'ignore')}")
+        shutil.rmtree(repo_path, ignore_errors=True)
         return None
     except Exception as e:
         logging.error(f"An unexpected error occurred with {repo_url}: {e}")
+        # A timed-out (or otherwise failed) clone leaves a partial bare repo
+        # on disk -- clean it up so scratch usage doesn't leak. Neither this
+        # nor the CalledProcessError branch above did this before.
+        shutil.rmtree(repo_path, ignore_errors=True)
         return None
 
 
