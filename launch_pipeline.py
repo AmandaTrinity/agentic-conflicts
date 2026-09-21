@@ -177,9 +177,10 @@ def build_universe(
         )
 
     if use_pilot and pilot_count > 0:
-        unique_repos = universe_df['full_name'].dropna().unique()[:pilot_count]
+        all_repos = universe_df['full_name'].dropna().unique()
+        unique_repos = all_repos[:pilot_count]
+        logging.info(f"Pilot mode (first-N): restricted to {len(unique_repos)} repositories")
         universe_df = universe_df[universe_df['full_name'].isin(unique_repos)]
-        logging.info(f"Pilot mode: restricted to {len(unique_repos)} repositories")
 
     data_dir.mkdir(parents=True, exist_ok=True)
     universe_df.to_parquet(data_dir / 'universe.parquet')
@@ -310,7 +311,16 @@ def process_repositories_fused(
         for i, repo_info in enumerate(repo_groups):
             _handle_result(i, process_func(repo_info))
     else:
-        with multiprocessing.Pool(workers) as pool:
+        # maxtasksperchild recycles each worker after 200 repos: on a
+        # multi-week run, a large sorted repo_groups list built (and
+        # LPT-sorted) in the parent before the pool forks gets copy-on-write
+        # shared into every child, but CPython's refcounting/GC touches
+        # those pages over time regardless of use, slowly dirtying (i.e.
+        # duplicating) them per child -- this was observed ballooning a
+        # single worker to 61GB RSS (93.6% of RAM) and getting OOM-killed
+        # every ~7-10 minutes on the v5 full run. Periodically replacing
+        # workers bounds the accumulated dirty-page growth per worker.
+        with multiprocessing.Pool(workers, maxtasksperchild=200) as pool:
             for i, result in enumerate(pool.imap_unordered(process_func, repo_groups)):
                 _handle_result(i, result)
 
