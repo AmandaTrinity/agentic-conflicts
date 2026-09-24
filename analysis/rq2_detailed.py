@@ -222,7 +222,14 @@ def analyze_postponed(
     if strategy_col not in chunks.columns:
         return pd.DataFrame()
 
-    chunks = chunks.dropna(subset=['agent', strategy_col])
+    # Unlike every other RQ2 step, this one runs on the *full* (unfiltered by
+    # resolver_type) chunk frame -- at full-dataset scale that's ~1.5M rows
+    # still carrying the heavy raw-text columns (v1/base/v2/resolution) that
+    # this function never reads. Slicing to just the two needed columns
+    # before dropna/groupby avoids copying that text at all; on the v5 full
+    # run, calling dropna() on the whole frame here observably spiked RSS to
+    # ~61GB (near the 62GB box limit) and got OOM-killed.
+    chunks = chunks[['agent', strategy_col]].dropna(subset=['agent', strategy_col])
 
     results = []
     for agent, agent_chunks in chunks.groupby('agent'):
