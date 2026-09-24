@@ -193,6 +193,8 @@ def build_merge_artifact_frame(tables: AnalysisTables) -> pd.DataFrame:
 
     merges = tables.internal_merges
     if merges.empty:
+        merges = merges.copy()
+        merges["n_files_conflicting"] = pd.Series(dtype=int)
         return merges
 
     merges = _dedup_on(merges, _MERGE_KEY).copy()
@@ -247,13 +249,33 @@ def build_merge_artifact_frame(tables: AnalysisTables) -> pd.DataFrame:
     return merges
 
 
-def build_chunk_frame(tables: AnalysisTables) -> pd.DataFrame:
-    """Chunk-level analysis frame with strategy and context."""
+def build_chunk_frame(tables: AnalysisTables, include_text: bool = False) -> pd.DataFrame:
+    """Chunk-level analysis frame with strategy and context.
+
+    Args:
+        include_text: keep the raw v1/base/v2/resolution conflict text
+            columns from classified_chunks. Defaults to False because no
+            current RQ1/RQ2 analysis reads this text (only the precomputed
+            *_loc counts and strategy labels) -- at full-dataset scale
+            (1.5M+ chunks), carrying it through the two merges below
+            duplicates that text on every merge, which was observed
+            exhausting 62GB RAM plus the entire 8GB swap during RQ2
+            analysis. Pass True for analyses that need the actual text
+            (e.g. comparing resolution content, as planned for Goal 2).
+    """
     from .file_category import categorize_filepath
 
     chunks = tables.classified_chunks
     if chunks.empty:
+        chunks = chunks.copy()
+        chunks["strategy"] = pd.Series(dtype=object)
+        chunks["strategy_raw"] = pd.Series(dtype=object)
         return chunks
+
+    if not include_text:
+        chunks = chunks.drop(
+            columns=["v1", "base", "v2", "resolution"], errors="ignore"
+        )
 
     chunks = _canonicalize_strategy(chunks)
 
@@ -287,6 +309,9 @@ def build_merge_frame(tables: AnalysisTables) -> pd.DataFrame:
     """Merge-level analysis frame with chunk counts and context."""
     merges = tables.internal_merges
     if merges.empty:
+        merges = merges.copy()
+        merges["n_chunks"] = pd.Series(dtype=int)
+        merges["has_conflict"] = pd.Series(dtype=bool)
         return merges
 
     merges = _dedup_on(merges, _MERGE_KEY).copy()
