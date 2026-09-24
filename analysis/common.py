@@ -151,7 +151,10 @@ def _canonicalize_strategy(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_tables(
-    data_dir: str = None, deduplicate: bool = True, include_resolved_text: bool = False
+    data_dir: str = None,
+    deduplicate: bool = True,
+    include_resolved_text: bool = False,
+    include_text: bool = False,
 ) -> AnalysisTables:
     """Load analysis tables from data directory.
 
@@ -163,6 +166,16 @@ def load_tables(
             at full-dataset scale that's a real chunk of the 62GB+RAM/8GB
             swap exhaustion seen during analysis. Pass True for future
             analyses that need the actual resolved text (e.g. Goal 2).
+        include_text: same idea, for classified_chunks. build_chunk_frame()
+            already drops this text from its own derived copy, but the
+            original held on tables.classified_chunks persisted in memory
+            for the whole Stage 3-7 run regardless -- with resolved_chunks
+            fixed, this became the next-largest contributor to the same
+            memory exhaustion (Stage 7 still died at ~55GB baseline before
+            doing any of its own work). The text is never lost -- it's
+            always on disk in classified_chunks.parquet; pass True here,
+            or read that parquet directly, whenever an analysis (e.g. a
+            future Goal 2 script) actually needs the raw text.
     """
     if data_dir is None:
         data_dir = DATA_DIR
@@ -171,6 +184,10 @@ def load_tables(
     universe = _read_parquet_optional(data_dir / "universe.parquet")
     internal_merges = _read_parquet_optional(data_dir / "internal_merges.parquet")
     classified_chunks = _read_parquet_optional(data_dir / "classified_chunks.parquet")
+    if not include_text:
+        classified_chunks = classified_chunks.drop(
+            columns=["v1", "base", "v2", "resolution"], errors="ignore"
+        )
     resolved_chunks = _read_parquet_optional(data_dir / "resolved_chunks.parquet")
     if not include_resolved_text:
         resolved_chunks = resolved_chunks.drop(
