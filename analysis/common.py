@@ -150,8 +150,20 @@ def _canonicalize_strategy(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_tables(data_dir: str = None, deduplicate: bool = True) -> AnalysisTables:
-    """Load analysis tables from data directory."""
+def load_tables(
+    data_dir: str = None, deduplicate: bool = True, include_resolved_text: bool = False
+) -> AnalysisTables:
+    """Load analysis tables from data directory.
+
+    Args:
+        include_resolved_text: keep resolved_chunks' raw v1/base/v2/resolution
+            conflict text. Defaults to False -- no current analysis reads
+            resolved_chunks at all, so this table sat in memory for the
+            entire Stage 3-7 run carrying full conflict text for nothing;
+            at full-dataset scale that's a real chunk of the 62GB+RAM/8GB
+            swap exhaustion seen during analysis. Pass True for future
+            analyses that need the actual resolved text (e.g. Goal 2).
+    """
     if data_dir is None:
         data_dir = DATA_DIR
     data_dir = Path(data_dir)
@@ -160,6 +172,10 @@ def load_tables(data_dir: str = None, deduplicate: bool = True) -> AnalysisTable
     internal_merges = _read_parquet_optional(data_dir / "internal_merges.parquet")
     classified_chunks = _read_parquet_optional(data_dir / "classified_chunks.parquet")
     resolved_chunks = _read_parquet_optional(data_dir / "resolved_chunks.parquet")
+    if not include_resolved_text:
+        resolved_chunks = resolved_chunks.drop(
+            columns=["v1", "base", "v2", "resolution"], errors="ignore"
+        )
     extraction_errors = _read_parquet_optional(data_dir / "extraction_errors.parquet")
 
     if deduplicate:
