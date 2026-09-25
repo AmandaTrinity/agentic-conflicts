@@ -10,17 +10,12 @@ Usage:
     # Pilot run
     python launch_pipeline.py --aidev-dir /path/to/AIDev --data-dir ./data --pilot 10 --workers 4
 
-    # Sharded run (this machine handles shard 1 of 3; run on other machines with
-    # --shard 2/3, --shard 3/3, each with its own --data-dir, then merge results)
-    python launch_pipeline.py --aidev-dir /path/to/AIDev --data-dir ./data-shard1 --shard 1/3 --workers 24
-
     # Analysis only
     python launch_pipeline.py --analyze-only --data-dir ./data
 """
 
 import argparse
 import functools
-import hashlib
 import logging
 import multiprocessing
 import sys
@@ -78,24 +73,11 @@ def log_disk_usage(data_dir: Path):
     logging.info(f"[DISK USAGE] Scratch: {scratch_size_mb:.1f} MB, JSONL: {jsonl_size_mb:.1f} MB")
 
 
-def _assign_shard(full_name: str, shard_count: int) -> int:
-    """Deterministic 0-indexed shard assignment, stable across machines/runs.
-
-    Hashes full_name with md5 (not Python's built-in hash(), which is
-    randomized per-process via PYTHONHASHSEED) so every machine computes the
-    same assignment for the same repo without coordinating with each other.
-    """
-    digest = hashlib.md5(full_name.encode("utf-8")).hexdigest()
-    return int(digest, 16) % shard_count
-
-
 def build_universe(
     aidev_dir: Path,
     data_dir: Path,
     use_pilot: bool = False,
     pilot_count: int = 0,
-    shard_index: int = None,
-    shard_count: int = None,
 ) -> pd.DataFrame:
     """Build the analysis universe from AIDev dataset."""
     logging.info("Stage 0: Building universe DataFrame from AIDev...")
@@ -165,17 +147,6 @@ def build_universe(
     else:
         universe_df = pr_repo_task_df[cols_to_keep].rename(columns={'id': 'pr_id'})
         universe_df['sha'] = None
-
-    if shard_index is not None and shard_count is not None:
-        before = universe_df['full_name'].nunique()
-        assigned = universe_df['full_name'].dropna().apply(
-            lambda name: _assign_shard(name, shard_count)
-        )
-        universe_df = universe_df[assigned == shard_index]
-        logging.info(
-            f"Shard {shard_index + 1}/{shard_count}: {universe_df['full_name'].nunique()} "
-            f"of {before} repos assigned to this machine"
-        )
 
     if use_pilot and pilot_count > 0:
         all_repos = universe_df['full_name'].dropna().unique()
@@ -366,12 +337,6 @@ def main():
                              'second time restricted to repos with >= N stars '
                              '(AIDev-pop-style filter), writing to results/pop/. '
                              'Requires --aidev-dir (for star counts).')
-    parser.add_argument('--shard', type=str, default=None,
-                        help='Process only shard i of N repositories, e.g. "1/3". '
-                             'Repos are assigned to shards by a stable hash of full_name, '
-                             'so running the same --shard on different machines never '
-                             'overlaps. Use a separate --data-dir per machine, then merge '
-                             'the resulting Parquet files.')
     parser.add_argument('--workers', type=int, default=1,
                         help='Number of parallel workers (default: 1)')
     parser.add_argument('--compact-every', type=int, default=1000,
@@ -382,17 +347,6 @@ def main():
                         help='Aggressively clean scratch after each repo (already done in finally, this is extra)')
 
     args = parser.parse_args()
-
-    shard_index, shard_count = None, None
-    if args.shard is not None:
-        try:
-            i_str, n_str = args.shard.split('/')
-            shard_index, shard_count = int(i_str) - 1, int(n_str)
-            if not (0 <= shard_index < shard_count):
-                raise ValueError
-        except ValueError:
-            print(f"✗ ERROR: --shard must be 'i/N' with 1 <= i <= N (got: {args.shard})")
-            sys.exit(1)
 
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -483,8 +437,6 @@ def main():
             sys.exit(1)
 
         mode = f"PILOT ({args.pilot} repos)" if args.pilot else "FULL"
-        if args.shard is not None:
-            mode += f" [SHARD {shard_index + 1}/{shard_count}]"
         logging.info(f"\n[MODE] {mode}")
         logging.info(f"[DATA] AIDev: {aidev_dir}")
         logging.info(f"[DATA] Output: {data_dir}")
@@ -497,8 +449,6 @@ def main():
                 data_dir,
                 use_pilot=(args.pilot is not None),
                 pilot_count=args.pilot or 0,
-                shard_index=shard_index,
-                shard_count=shard_count,
             )
 
             scratch_dir = data_dir / 'scratch'
