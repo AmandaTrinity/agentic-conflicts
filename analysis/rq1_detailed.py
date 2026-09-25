@@ -126,15 +126,25 @@ def compute_resolver_by_agent(tables: AnalysisTables) -> Tuple[pd.DataFrame, Dic
 
     resolvers = resolvers.dropna(subset=['agent'])
 
-    # Create contingency table
     if 'resolver_type' not in resolvers.columns:
-        # Fallback: use binary agent/human classification
-        resolvers['resolver_type'] = 'human'
-        agent_mask = resolvers['agent'].str.lower().str.contains(
-            'agent|bot|claude|copilot|cursor|devin|openai',
-            na=False
+        # `resolvers['agent']` here is the PR-*authoring* agent (who opened
+        # the PR), not who resolved this specific conflict -- those are
+        # independent questions (a human can resolve a conflict on an
+        # agent-opened PR and vice versa, which is exactly what RQ1 measures).
+        # A previous version of this branch guessed resolver_type by matching
+        # agent names as substrings of the *authoring* agent column, which
+        # silently fabricated a ~100%-"agent" result (and mislabeled every
+        # Google_Jules PR as "human", since "jules" wasn't even in the
+        # substring list) instead of reflecting who actually committed the
+        # merge. resolver_type should always be present via internal_merges
+        # (set per-commit by classify_resolver() in analysis_utils.py) --
+        # if it's missing, skip rather than fabricate the headline RQ1 stat.
+        logging.warning(
+            "compute_resolver_by_agent: 'resolver_type' missing from merge "
+            "frame -- skipping (cannot infer resolver identity from the "
+            "PR-authoring agent column)."
         )
-        resolvers.loc[agent_mask, 'resolver_type'] = 'agent'
+        return pd.DataFrame(), {}
 
     # Crosstab: agent × resolver_type
     crosstab = pd.crosstab(
