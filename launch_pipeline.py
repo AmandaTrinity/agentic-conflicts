@@ -35,6 +35,7 @@ from analysis.rq1_resolver import analyze_rq1
 from analysis.rq1_detailed import analyze_rq1_detailed
 from analysis.rq2_strategies import analyze_rq2
 from analysis.rq2_detailed import analyze_rq2_detailed
+from analysis.filter_pop import filter_to_pop
 from analysis.plotting import generate_all_figures
 from analysis import reproduce_paper_statistics
 from src.analysis_utils import (
@@ -360,6 +361,11 @@ def main():
                         help='Data directory for outputs (default: ./data)')
     parser.add_argument('--pilot', type=int, default=None,
                         help='Run pilot mode on N repositories')
+    parser.add_argument('--min-stars', type=int, default=None,
+                        help='With --analyze-only, also run the full analysis a '
+                             'second time restricted to repos with >= N stars '
+                             '(AIDev-pop-style filter), writing to results/pop/. '
+                             'Requires --aidev-dir (for star counts).')
     parser.add_argument('--shard', type=str, default=None,
                         help='Process only shard i of N repositories, e.g. "1/3". '
                              'Repos are assigned to shards by a stable hash of full_name, '
@@ -418,15 +424,37 @@ def main():
 
             logging.info("\n[STAGE 2] RQ1 Analysis: Who Resolves?")
             analyze_rq1(tables, output_dir=str(results_dir))
+            analyze_rq1_detailed(tables, output_dir=str(results_dir))
 
             logging.info("\n[STAGE 3] RQ2 Analysis: How Do They Resolve?")
             analyze_rq2(tables, output_dir=str(results_dir))
+            analyze_rq2_detailed(tables, output_dir=str(results_dir))
 
             logging.info("\n[STAGE 4] Figure Generation")
             generate_all_figures(tables, output_dir=str(results_dir))
 
             logging.info("\n[STAGE 5] Reproducing Paper Statistics (with sanity checks)")
             reproduce_paper_statistics.main(str(data_dir))
+
+            if args.min_stars is not None:
+                if args.aidev_dir is None:
+                    logging.error(
+                        "✗ ERROR: --min-stars requires --aidev-dir (for star counts)"
+                    )
+                    sys.exit(1)
+                pop_dir = results_dir / "pop"
+                logging.info(
+                    f"\n[STAGE 6] AIDev-pop comparison (>= {args.min_stars} stars)"
+                )
+                pop_tables = filter_to_pop(
+                    tables, Path(args.aidev_dir), min_stars=args.min_stars
+                )
+                analyze_dataset(pop_tables, output_dir=str(pop_dir))
+                analyze_rq1(pop_tables, output_dir=str(pop_dir))
+                analyze_rq1_detailed(pop_tables, output_dir=str(pop_dir))
+                analyze_rq2(pop_tables, output_dir=str(pop_dir))
+                analyze_rq2_detailed(pop_tables, output_dir=str(pop_dir))
+                logging.info(f"  AIDev-pop results saved to: {pop_dir}")
 
             logging.info("\n" + "=" * 70)
             logging.info("✓ Analysis complete!")
